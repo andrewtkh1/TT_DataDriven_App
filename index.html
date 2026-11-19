@@ -25,6 +25,17 @@
   </section>
 
   <section>
+    <h2>Add a provider</h2>
+    <form id="add-form" class="add-form" autocomplete="off">
+      <label>Name<input name="pname" required maxlength="40" placeholder="Vercel"></label>
+      <label>Probe URL (https)<input name="probe" required placeholder="https://vercel.com/favicon.ico"></label>
+      <label>Status page domain <span class="opt">(optional, Statuspage sites)</span><input name="status" placeholder="www.vercel-status.com"></label>
+      <div class="row"><button type="submit">Add provider</button><button id="share" type="button">Copy share link</button></div>
+      <p id="form-msg" class="form-msg" aria-live="polite"></p>
+    </form>
+  </section>
+
+  <section>
     <h2>Control (your own connection)</h2>
     <div id="controls" class="cards"></div>
   </section>
@@ -35,6 +46,13 @@
     <p class="note"><button id="clear" type="button">Clear history</button> <button id="pause" type="button">Pause</button></p>
   </footer>
 </main>
+<dialog id="import-dialog">
+  <h3>Import providers from a share link?</h3>
+  <p class="note">Your browser will contact each URL below every 15 seconds. Only continue if you trust the sender.</p>
+  <ul id="import-list"></ul>
+  <p id="import-note" class="note"></p>
+  <div class="row"><button id="import-yes" type="button">Import</button><button id="import-no" type="button">Cancel</button></div>
+</dialog>
 <script src="app.js"></script>
 </body>
 </html>

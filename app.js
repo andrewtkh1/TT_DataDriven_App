@@ -7,13 +7,40 @@ const SLOW_ABS = 600, SLOW_REL = 2.5;
 const STORE_KEY = "meorthem.v1";
 
 // status = Atlassian Statuspage summary endpoint (public, CORS-enabled)
-const PROVIDERS = [
+const DEFAULTS = [
   { id: "github",     name: "GitHub",     probe: "https://api.github.com/zen",                 status: "https://www.githubstatus.com/api/v2/summary.json" },
   { id: "cloudflare", name: "Cloudflare", probe: "https://1.1.1.1/cdn-cgi/trace", status: "https://www.cloudflarestatus.com/api/v2/summary.json" },
   { id: "discord",    name: "Discord",    probe: "https://discord.com/api/v10/gateway",        status: "https://discordstatus.com/api/v2/summary.json" },
   { id: "openai",     name: "OpenAI",     probe: "https://api.openai.com/v1/models",           status: "https://status.openai.com/api/v2/summary.json" },
   { id: "netlify",    name: "Netlify",    probe: "https://www.netlify.com/favicon.ico",        status: "https://www.netlifystatus.com/api/v2/summary.json" },
 ];
+const MAX_CUSTOM = 20;
+const PROV_KEY = "meorthem.providers.v1";
+let custom = [];   // user-added: {id,name,probe,status|null,custom:true}
+try { custom = (JSON.parse(localStorage.getItem(PROV_KEY)) || []).map(sanitize).filter(Boolean).slice(0, MAX_CUSTOM); } catch (_) { custom = []; }
+const saveCustom = () => { try { localStorage.setItem(PROV_KEY, JSON.stringify(custom)); } catch (_) {} };
+const providers = () => [...DEFAULTS, ...custom];
+
+// Validate/normalise a provider from untrusted input (form, storage, share link).
+function statusUrlFromDomain(d) {
+  d = String(d || "").trim().replace(/^https?:\/\//i, "").replace(/[\/?#].*$/, "").toLowerCase();
+  if (!d) return null;
+  return /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$/.test(d) ? `https://${d}/api/v2/summary.json` : undefined;
+}
+function sanitize(p) {
+  if (!p || typeof p !== "object") return null;
+  const name = String(p.name || "").trim().slice(0, 40);
+  let probe;
+  try { const u = new URL(String(p.probe || "").trim()); if (u.protocol !== "https:") return null; probe = u.href; } catch (_) { return null; }
+  if (!name) return null;
+  let status = null;
+  if (p.status) {
+    try { const u = new URL(p.status); if (u.protocol !== "https:" || !u.pathname.endsWith("/api/v2/summary.json")) return null; status = u.href; } catch (_) { return null; }
+  }
+  return { id: "c_" + hash(probe), name, probe, status, custom: true };
+}
+function hash(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; return h.toString(36); }
+
 const CONTROLS = [
   { id: "google", name: "Google",         probe: "https://www.google.com/generate_204" },
   { id: "wiki",   name: "Wikipedia",      probe: "https://en.wikipedia.org/static/favicon/wikipedia.ico" },
@@ -43,7 +70,7 @@ async function timeOnce(url) {
 }
 
 async function probeAll() {
-  const all = [...PROVIDERS, ...CONTROLS];
+  const all = [...providers(), ...CONTROLS];
   const res = await Promise.all(all.map(async p => [p.id, await timeOnce(p.probe)]));
   const t = Date.now();
   for (const [id, ms] of res) {
@@ -69,7 +96,7 @@ async function fetchStatus(p) {
     statuses[p.id] = { ok: false, at: Date.now() };
   }
 }
-async function statusAll() { await Promise.all(PROVIDERS.map(fetchStatus)); render(); }
+async function statusAll() { await Promise.all(providers().filter(p => p.status).map(fetchStatus)); render(); }
 
 // ---- Analysis -----------------------------------------------------------
 const median = a => { const s = a.filter(x => x != null).sort((x, y) => x - y); return s.length ? s[s.length >> 1] : null; };
@@ -100,12 +127,12 @@ function verdict() {
       detail: "All control endpoints are slow right now, which points to your own network or ISP rather than a single provider." };
   }
 
-  const bad = PROVIDERS.map(p => ({ p, s: probeState(p.id), st: statuses[p.id] }))
+  const bad = providers().map(p => ({ p, s: probeState(p.id), st: statuses[p.id] }))
     .filter(x => x.s.state === "down" || x.s.state === "slow" || (x.st && x.st.ok && x.st.indicator !== "none"));
   if (!bad.length) {
-    const checked = PROVIDERS.filter(p => probeState(p.id).state === "ok").length;
+    const checked = providers().filter(p => probeState(p.id).state === "ok").length;
     return { cls: "ok", title: "All clear",
-      detail: `Your connection looks fine and ${checked} of ${PROVIDERS.length} providers are responding normally with no reported incidents.` };
+      detail: `Your connection looks fine and ${checked} of ${providers().length} providers are responding normally with no reported incidents.` };
   }
   const lines = bad.map(({ p, s, st }) => {
     const reported = st && st.ok && st.indicator !== "none";
@@ -150,7 +177,8 @@ function card(p, withStatus) {
   const h = hist[p.id] || [];
   const med = median(h.map(x => x.ms));
   let inc = "";
-  if (withStatus) {
+  if (withStatus && !p.status) inc = `<p class="inc">Status: no status feed (latency only)</p>`;
+  else if (withStatus) {
     const st = statuses[p.id];
     if (!st) inc = `<p class="inc">Status: loading…</p>`;
     else if (!st.ok) inc = `<p class="inc">Status: unavailable</p>`;
@@ -159,12 +187,13 @@ function card(p, withStatus) {
   }
   const now = s.last == null ? (s.state === "none" ? "—" : "×") : s.last;
   return `<div class="card"><h3>${esc(p.name)}<span class="badge ${cls}">${label}</span></h3>
+    ${p.custom ? `<button class="rm" data-rm="${p.id}" type="button">Remove</button>` : ""}
     <div class="ms">${now}<small> ms${med != null ? ` · median ${med}` : ""}</small></div>
     ${spark(h)}${inc}</div>`;
 }
 
 function render() {
-  $("cards").innerHTML = PROVIDERS.map(p => card(p, true)).join("");
+  $("cards").innerHTML = providers().map(p => card(p, true)).join("");
   $("controls").innerHTML = CONTROLS.map(p => card(p, false)).join("");
   const v = verdict(), el = $("verdict");
   el.className = "verdict " + v.cls;
@@ -172,10 +201,87 @@ function render() {
   $("meta").textContent = "Last updated " + new Date().toLocaleTimeString() + (paused ? " (paused)" : "");
 }
 
+// ---- Add / remove / share providers --------------------------------------
+const msg = (t, cls) => { const m = $("form-msg"); m.textContent = t; m.className = "form-msg " + (cls || ""); };
+const exists = probe => providers().some(p => p.probe === probe);
+
+$("add-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  const f = e.target, btn = f.querySelector("button[type=submit]");
+  if (custom.length >= MAX_CUSTOM) return msg(`Limit of ${MAX_CUSTOM} added providers reached. Remove one first.`, "bad");
+  const rawProbe = f.probe.value.trim();
+  if (/^http:\/\//i.test(rawProbe)) return msg("The probe URL must start with https:// (browsers block plain http from an https page).", "bad");
+  const sUrl = statusUrlFromDomain(f.status.value);
+  if (sUrl === undefined) return msg("That status domain doesn't look valid. Use something like status.example.com.", "bad");
+  const p = sanitize({ name: f.pname.value, probe: /^https:\/\//i.test(rawProbe) ? rawProbe : "https://" + rawProbe, status: sUrl });
+  if (!p) return msg("Name and a valid https:// probe URL are required.", "bad");
+  if (exists(p.probe)) return msg("A provider with that probe URL already exists.", "bad");
+
+  btn.disabled = true; msg("Testing…");
+  const warns = [];
+  const ms = await timeOnce(p.probe);
+  if (ms == null) warns.push("the probe URL didn't respond (it may be down, blocked, or unreachable from this browser)");
+  if (p.status) {
+    await fetchStatus(p);
+    if (!statuses[p.id].ok) warns.push("the status feed couldn't be read (wrong domain, not a Statuspage site, or no CORS), so it will show latency only");
+  }
+  custom.push(p); saveCustom();
+  msg(warns.length ? `Added "${p.name}", but ${warns.join("; and ")}.` : `Added "${p.name}".`, warns.length ? "warn" : "ok");
+  f.reset(); btn.disabled = false;
+  probeAll();
+});
+
+$("cards").addEventListener("click", e => {
+  const id = e.target.dataset && e.target.dataset.rm;
+  if (!id) return;
+  custom = custom.filter(p => p.id !== id); delete hist[id]; delete statuses[id];
+  saveCustom(); save(); render();
+});
+
+const b64 = {
+  enc: o => btoa(unescape(encodeURIComponent(JSON.stringify(o)))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""),
+  dec: s => JSON.parse(decodeURIComponent(escape(atob(s.replace(/-/g, "+").replace(/_/g, "/"))))),
+};
+
+$("share").onclick = async () => {
+  if (!custom.length) return msg("Add at least one provider before sharing.", "warn");
+  const url = location.origin + location.pathname + "#share=" + b64.enc(custom.map(({ name, probe, status }) => ({ name, probe, status })));
+  try { await navigator.clipboard.writeText(url); msg("Share link copied to clipboard.", "ok"); }
+  catch (_) { prompt("Copy this share link:", url); }
+};
+
+function checkShareLink() {
+  const m = location.hash.match(/^#share=(.+)$/);
+  if (!m) return;
+  history.replaceState(null, "", location.pathname + location.search);
+  let list;
+  try { list = b64.dec(m[1]); if (!Array.isArray(list)) throw 0; } catch (_) { return msg("That share link couldn't be read.", "bad"); }
+  const seen = new Set(providers().map(p => p.probe));
+  const incoming = [];
+  for (const raw of list) {
+    const p = sanitize(raw);
+    if (p && !seen.has(p.probe)) { seen.add(p.probe); incoming.push(p); }
+  }
+  const room = MAX_CUSTOM - custom.length, take = incoming.slice(0, Math.max(0, room));
+  if (!take.length) return msg("The share link had nothing new to add (duplicates, invalid entries, or the 20-provider limit).", "warn");
+  const ul = $("import-list"); ul.textContent = "";
+  for (const p of take) {
+    const li = document.createElement("li");
+    li.textContent = `${p.name} — ${p.probe}` + (p.status ? ` (status: ${new URL(p.status).host})` : "");
+    ul.appendChild(li);
+  }
+  $("import-note").textContent = incoming.length > take.length ? `${incoming.length - take.length} more were skipped because of the ${MAX_CUSTOM}-provider limit.` : "";
+  const dlg = $("import-dialog");
+  $("import-yes").onclick = () => { custom.push(...take); saveCustom(); dlg.close(); msg(`Imported ${take.length} provider(s).`, "ok"); probeAll(); statusAll(); };
+  $("import-no").onclick = () => dlg.close();
+  dlg.showModal();
+}
+
 // ---- Wire up ------------------------------------------------------------
 $("clear").onclick = () => { hist = {}; save(); render(); };
 $("pause").onclick = e => { paused = !paused; e.target.textContent = paused ? "Resume" : "Pause"; render(); };
 render();
+checkShareLink();
 probeAll(); statusAll();
 setInterval(() => { if (!paused && !document.hidden) probeAll(); }, PROBE_MS);
 setInterval(() => { if (!paused && !document.hidden) statusAll(); }, STATUS_MS);
