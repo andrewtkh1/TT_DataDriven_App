@@ -1,7 +1,7 @@
 "use strict";
 
 // ---- Config -------------------------------------------------------------
-const PROBE_MS = 15000, STATUS_MS = 60000, TIMEOUT_MS = 5000;
+const PROBE_MS = 15000, STATUS_MS = 60000, TIMEOUT_MS = 5000, STATUS_TIMEOUT_MS = 8000;
 const MAX_SAMPLES = 120;            // ~30 min of history per target
 const SLOW_ABS = 600, SLOW_REL = 2.5;
 const STORE_KEY = "meorthem.v1";
@@ -27,19 +27,31 @@ function statusUrlFromDomain(d) {
   if (!d) return null;
   return /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$/.test(d) ? `https://${d}/api/v2/summary.json` : undefined;
 }
+// Reject loopback, private, link-local, IP-literal-IPv6 and single-label/internal hosts so a
+// shared list can't make the browser probe the user's own network.
+function isPublicHost(host) {
+  host = host.toLowerCase();
+  if (host.startsWith("[") || !host.includes(".")) return false;
+  if (/\.(local|localhost|internal|lan|home|corp|intranet|test|invalid)$/.test(host)) return false;
+  const m = host.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (m) {
+    const [a, b] = [+m[1], +m[2]];
+    if (a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127)) return false;
+  }
+  return true;
+}
 function sanitize(p) {
   if (!p || typeof p !== "object") return null;
   const name = String(p.name || "").trim().slice(0, 40);
   let probe;
-  try { const u = new URL(String(p.probe || "").trim()); if (u.protocol !== "https:") return null; probe = u.href; } catch (_) { return null; }
+  try { const u = new URL(String(p.probe || "").trim()); if (u.protocol !== "https:" || !isPublicHost(u.hostname)) return null; probe = u.href; } catch (_) { return null; }
   if (!name) return null;
   let status = null;
   if (p.status) {
-    try { const u = new URL(p.status); if (u.protocol !== "https:" || !u.pathname.endsWith("/api/v2/summary.json")) return null; status = u.href; } catch (_) { return null; }
+    try { const u = new URL(p.status); if (u.protocol !== "https:" || !isPublicHost(u.hostname) || !u.pathname.endsWith("/api/v2/summary.json")) return null; status = u.href; } catch (_) { return null; }
   }
-  return { id: "c_" + hash(probe), name, probe, status, custom: true };
+  return { id: "c_" + btoa(probe).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""), name, probe, status, custom: true };
 }
-function hash(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; return h.toString(36); }
 
 const CONTROLS = [
   { id: "google", name: "Google",         probe: "https://www.google.com/generate_204" },
@@ -70,19 +82,29 @@ async function timeOnce(url) {
 }
 
 async function probeAll() {
-  const all = [...providers(), ...CONTROLS];
-  const res = await Promise.all(all.map(async p => [p.id, await timeOnce(p.probe)]));
-  const t = Date.now();
-  for (const [id, ms] of res) {
-    (hist[id] = hist[id] || []).push({ t, ms });
-    if (hist[id].length > MAX_SAMPLES) hist[id].shift();
-  }
-  save(); render();
+  const list = [...providers(), ...CONTROLS];
+  await Promise.all(list.map(async p => {
+    const ms = await timeOnce(p.probe);
+    // Skip providers removed while the probe was in flight (would resurrect their history).
+    if (!providers().some(x => x.id === p.id) && !CONTROLS.some(x => x.id === p.id)) return;
+    const h = (hist[p.id] = hist[p.id] || []);
+    h.push({ t: Date.now(), ms });
+    if (h.length > MAX_SAMPLES) h.shift();
+    scheduleRender();
+  }));
+  save();
+}
+
+let renderQueued = false;
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  setTimeout(() => { renderQueued = false; render(); }, 50);
 }
 
 async function fetchStatus(p) {
   try {
-    const r = await fetch(p.status, { cache: "no-store" });
+    const r = await fetch(p.status, { cache: "no-store", signal: AbortSignal.timeout(STATUS_TIMEOUT_MS) });
     if (!r.ok) throw new Error(r.status);
     const j = await r.json();
     statuses[p.id] = {
@@ -99,6 +121,7 @@ async function fetchStatus(p) {
 async function statusAll() { await Promise.all(providers().filter(p => p.status).map(fetchStatus)); render(); }
 
 // ---- Analysis -----------------------------------------------------------
+const isIncident = st => !!(st && st.ok && st.indicator !== "none" && st.indicator !== "maintenance");
 const median = a => { const s = a.filter(x => x != null).sort((x, y) => x - y); return s.length ? s[s.length >> 1] : null; };
 
 // state: "ok" | "slow" | "down" | "none"
@@ -127,24 +150,27 @@ function verdict() {
       detail: "All control endpoints are slow right now, which points to your own network or ISP rather than a single provider." };
   }
 
+  const badCtl = CONTROLS.filter((c, i) => ctl[i].state === "down" || ctl[i].state === "slow").map(c => c.name);
+  const ctlNote = badCtl.length ? ` Note: control endpoint${badCtl.length > 1 ? "s" : ""} ${badCtl.join(", ")} ${badCtl.length > 1 ? "are" : "is"} also failing or slow, so part of this may be your own network.` : "";
   const bad = providers().map(p => ({ p, s: probeState(p.id), st: statuses[p.id] }))
-    .filter(x => x.s.state === "down" || x.s.state === "slow" || (x.st && x.st.ok && x.st.indicator !== "none"));
+    .filter(x => x.s.state === "down" || x.s.state === "slow" || isIncident(x.st));
   if (!bad.length) {
     const checked = providers().filter(p => probeState(p.id).state === "ok").length;
+    if (ctlNote) return { cls: "warn", title: "Providers look fine, but a control is failing", detail: "All providers respond normally." + ctlNote };
     return { cls: "ok", title: "All clear",
       detail: `Your connection looks fine and ${checked} of ${providers().length} providers are responding normally with no reported incidents.` };
   }
   const lines = bad.map(({ p, s, st }) => {
-    const reported = st && st.ok && st.indicator !== "none";
+    const reported = isIncident(st);
     const measured = s.state === "down" || s.state === "slow";
     if (reported && measured) return `${p.name}: confirmed — slow/unreachable from here and the provider reports an incident.`;
     if (reported) return `${p.name}: provider reports an incident (${st.description.toLowerCase()}) but latency from here is normal.`;
     return `${p.name}: ${s.state === "down" ? "unreachable" : "slow"} from here but no incident reported (could be a regional or path issue).`;
   });
   const measured = bad.some(({ s }) => s.state === "down" || s.state === "slow");
-  if (!measured) return { cls: "warn", title: "Incident reported, but not affecting you", detail: "Your connection is fine. " + lines.join("  ") };
-  const confirmed = bad.some(({ s, st }) => (s.state !== "ok") && st && st.ok && st.indicator !== "none");
-  return { cls: confirmed ? "bad" : "warn", title: "It's probably them", detail: lines.join("  ") };
+  if (!measured) return { cls: "warn", title: "Incident reported, but not affecting you", detail: "Your connection looks fine. " + lines.join("  ") + ctlNote };
+  const confirmed = bad.some(({ s, st }) => s.state !== "ok" && isIncident(st));
+  return { cls: confirmed ? "bad" : "warn", title: "It's probably them", detail: lines.join("  ") + ctlNote };
 }
 
 // ---- Rendering ----------------------------------------------------------
@@ -214,7 +240,7 @@ $("add-form").addEventListener("submit", async e => {
   const sUrl = statusUrlFromDomain(f.status.value);
   if (sUrl === undefined) return msg("That status domain doesn't look valid. Use something like status.example.com.", "bad");
   const p = sanitize({ name: f.pname.value, probe: /^https:\/\//i.test(rawProbe) ? rawProbe : "https://" + rawProbe, status: sUrl });
-  if (!p) return msg("Name and a valid https:// probe URL are required.", "bad");
+  if (!p) return msg("Name and a valid public https:// probe URL are required (localhost and private addresses are not allowed).", "bad");
   if (exists(p.probe)) return msg("A provider with that probe URL already exists.", "bad");
 
   btn.disabled = true; msg("Testing…");
@@ -225,7 +251,7 @@ $("add-form").addEventListener("submit", async e => {
     await fetchStatus(p);
     if (!statuses[p.id].ok) warns.push("the status feed couldn't be read (wrong domain, not a Statuspage site, or no CORS), so it will show latency only");
   }
-  custom.push(p); saveCustom();
+  custom.push(p); saveCustom(); render();
   msg(warns.length ? `Added "${p.name}", but ${warns.join("; and ")}.` : `Added "${p.name}".`, warns.length ? "warn" : "ok");
   f.reset(); btn.disabled = false;
   probeAll();
@@ -239,8 +265,14 @@ $("cards").addEventListener("click", e => {
 });
 
 const b64 = {
-  enc: o => btoa(unescape(encodeURIComponent(JSON.stringify(o)))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""),
-  dec: s => JSON.parse(decodeURIComponent(escape(atob(s.replace(/-/g, "+").replace(/_/g, "/"))))),
+  enc: o => {
+    const bytes = new TextEncoder().encode(JSON.stringify(o));
+    return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  },
+  dec: s => {
+    const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/"));
+    return JSON.parse(new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0))));
+  },
 };
 
 $("share").onclick = async () => {
