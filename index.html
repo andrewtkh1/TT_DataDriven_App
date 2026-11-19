@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Me or Them?</title>
+<meta name="description" content="Is a slowdown on your side or the provider's? Live browser latency plus provider status.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>Is it me, or them?</h1>
+    <p class="sub">Live latency from <em>your browser</em> combined with provider status pages, so you can tell whose problem it is.</p>
+  </header>
+
+  <section id="verdict" class="verdict checking" aria-live="polite">
+    <div class="v-title">Checking…</div>
+    <div class="v-detail">Running the first measurements.</div>
+  </section>
+
+  <section>
+    <h2>Providers</h2>
+    <div id="cards" class="cards"></div>
+  </section>
+
+  <section>
+    <h2>Control (your own connection)</h2>
+    <div id="controls" class="cards"></div>
+  </section>
+
+  <footer>
+    <p id="meta" class="note"></p>
+    <p class="note">How it works: the browser times a small request to each endpoint every 15 s (round trip incl. TLS, so it is approximate, not a traceroute). Status comes from each provider's public Statuspage API every 60 s. A probe is "slow" when it exceeds 600 ms and 2.5× its recent median. Control probes are independent of the providers, so if they are slow too, the problem is probably on your side. History is kept only in your browser.</p>
+    <p class="note"><button id="clear" type="button">Clear history</button> <button id="pause" type="button">Pause</button></p>
+  </footer>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
